@@ -1,15 +1,16 @@
 """
-AI Video Editor - Free & Open Source
+AI Video Editor - High Level Version
 --------------------------------------
-User video upload karta hai + text mein instruction likhta hai
-(jaise "pehle 10 second kaato" ya "text likho HELLO upar")
-App usko samajh kar FFmpeg se video edit karke deta hai.
+Naya upgrade:
+- Groq (free LLM API) se instruction samajhna - ab tum KAISI BHI
+  bhasha mein bol sakte ho, app samjhega aur sahi action lega
+- Whisper (open-source) se auto-subtitles
+- rembg (open-source) se background remove
+- FFmpeg se bahut saare effects: blur, vintage, vignette, zoom,
+  rotate, crop, watermark, fade, background music
 
-Chalane ka tareeka (local):
-    pip install -r requirements.txt
-    python app.py
-
-Free deploy: Hugging Face Spaces (README.md mein steps hain)
+Koi paid API nahi - Groq ka free tier use ho raha hai (bahut generous
+free limits deta hai), baaki sab khud ke server par chalta hai.
 """
 
 import gradio as gr
@@ -17,13 +18,16 @@ import subprocess
 import os
 import re
 import uuid
+import shutil
+import json
 
 WORK_DIR = "workdir"
 os.makedirs(WORK_DIR, exist_ok=True)
 
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+
 
 def run_ffmpeg(cmd):
-    """FFmpeg command chalata hai aur error catch karta hai."""
     print("Running:", " ".join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -31,192 +35,436 @@ def run_ffmpeg(cmd):
     return result
 
 
+def get_duration(video_path):
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+        capture_output=True, text=True
+    )
+    return float(probe.stdout.strip())
+
+
+# ---------------------------------------------------------------
+# LLM se instruction samajhna (Groq free API)
+# ---------------------------------------------------------------
+
+ACTIONS_SCHEMA = """
+Tum ek video editing assistant ho. User jo bhi Hindi/English mein bole,
+usko neeche diye actions mein se sabse sahi ek ya zyada actions mein
+convert karo. SIRF JSON return karo, kuch aur nahi.
+
+Available actions:
+- trim: {"action": "trim", "from_start_seconds": number} ya {"action": "trim", "from_end_seconds": number}
+- add_text: {"action": "add_text", "text": string}
+- speed: {"action": "speed", "factor": number}  (2.0 = 2x fast, 0.5 = slow motion)
+- mute: {"action": "mute"}
+- to_gif: {"action": "to_gif"}
+- extract_audio: {"action": "extract_audio"}
+- grayscale: {"action": "grayscale"}
+- remove_bg: {"action": "remove_bg"}
+- subtitles: {"action": "subtitles"}
+- blur: {"action": "blur", "strength": number}  (5-30 range)
+- vintage: {"action": "vintage"}
+- vignette: {"action": "vignette"}
+- zoom: {"action": "zoom", "factor": number}  (1.2 = 20% zoom in)
+- rotate: {"action": "rotate", "degrees": number}  (90, 180, 270)
+- crop_square: {"action": "crop_square"}
+- watermark_text: {"action": "watermark_text", "text": string}
+- fade: {"action": "fade"}
+- brightness: {"action": "brightness", "level": number}  (-1 to 1, negative=dark, positive=bright)
+
+User agar ek se zyada cheezein bole (jaise "cut karo aur text add karo"),
+toh multiple actions ki JSON list return karo.
+
+Format: {"actions": [ {...}, {...} ]}
+
+Agar user ka instruction kisi bhi action se match nahi karta,
+return: {"actions": [], "clarification": "kya karna hai clearly batao"}
+"""
+
+
+def understand_instruction_with_llm(instruction):
+    """Groq API use karke instruction ko structured actions mein convert karta hai."""
+    if not GROQ_API_KEY:
+        return None  # LLM available nahi hai, fallback use hoga
+
+    import urllib.request
+
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": [
+            {"role": "system", "content": ACTIONS_SCHEMA},
+            {"role": "user", "content": instruction}
+        ],
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"}
+    }
+
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            content = data["choices"][0]["message"]["content"]
+            parsed = json.loads(content)
+            return parsed.get("actions", [])
+    except Exception as e:
+        print("LLM error:", e)
+        return None
+
+
+# ---------------------------------------------------------------
+# Fallback: simple keyword matching (agar LLM available na ho)
+# ---------------------------------------------------------------
+
 def extract_number(text, default=None):
-    """Text se pehla number nikalta hai (seconds ke liye)."""
     match = re.search(r"(\d+(\.\d+)?)", text)
     if match:
         return float(match.group(1))
     return default
 
 
-def parse_instruction(instruction):
-    """
-    Simple keyword-based parser.
-    User ka Hindi/English mixed instruction padh kar
-    ek 'action plan' banata hai.
-
-    Yeh MVP hai - future mein isko LLM (Groq/Gemini free API)
-    se replace kar sakte ho for smarter understanding.
-    """
+def fallback_parse(instruction):
     text = instruction.lower()
-    plan = {"action": None, "params": {}}
+    actions = []
 
-    if any(word in text for word in ["cut", "trim", "kaato", "kato", "remove start", "hatao"]):
-        plan["action"] = "trim"
-        seconds = extract_number(text, default=10)
-        if "end" in text or "aakhir" in text or "last" in text:
-            plan["params"]["from_end"] = seconds
+    if any(w in text for w in ["background hatao", "background remove", "bg hatao"]):
+        actions.append({"action": "remove_bg"})
+    elif any(w in text for w in ["subtitle", "caption add", "likhawat"]):
+        actions.append({"action": "subtitles"})
+    elif any(w in text for w in ["cut", "trim", "kaato", "kato", "hatao"]):
+        sec = extract_number(text, default=10)
+        if "end" in text or "aakhir" in text:
+            actions.append({"action": "trim", "from_end_seconds": sec})
         else:
-            plan["params"]["from_start"] = seconds
-
-    elif any(word in text for word in ["text", "likho", "caption", "likh do", "overlay"]):
-        plan["action"] = "add_text"
-        # quotes ke andar ka text dhoondo, warna poora instruction use karo
+            actions.append({"action": "trim", "from_start_seconds": sec})
+    elif any(w in text for w in ["text", "likho", "overlay"]):
         quoted = re.findall(r'"([^"]+)"|\'([^\']+)\'', instruction)
-        if quoted:
-            plan["params"]["text"] = quoted[0][0] or quoted[0][1]
-        else:
-            plan["params"]["text"] = "Sample Text"
-
-    elif any(word in text for word in ["speed", "fast", "slow", "tez", "dheere"]):
-        plan["action"] = "speed"
+        t = (quoted[0][0] or quoted[0][1]) if quoted else "Sample Text"
+        actions.append({"action": "add_text", "text": t})
+    elif any(w in text for w in ["speed", "fast", "slow", "tez", "dheere"]):
         factor = extract_number(text, default=1.5)
-        if any(word in text for word in ["slow", "dheere"]):
-            plan["params"]["factor"] = 1 / factor if factor > 1 else factor
+        if any(w in text for w in ["slow", "dheere"]):
+            factor = 1 / factor if factor > 1 else factor
+        actions.append({"action": "speed", "factor": factor})
+    elif any(w in text for w in ["mute", "audio hatao", "silent"]):
+        actions.append({"action": "mute"})
+    elif any(w in text for w in ["gif"]):
+        actions.append({"action": "to_gif"})
+    elif any(w in text for w in ["audio nikaalo", "mp3", "audio extract"]):
+        actions.append({"action": "extract_audio"})
+    elif any(w in text for w in ["black white", "grayscale", "bw"]):
+        actions.append({"action": "grayscale"})
+    elif any(w in text for w in ["blur"]):
+        actions.append({"action": "blur", "strength": 15})
+    elif any(w in text for w in ["vintage", "purana", "retro"]):
+        actions.append({"action": "vintage"})
+    elif any(w in text for w in ["vignette"]):
+        actions.append({"action": "vignette"})
+    elif any(w in text for w in ["zoom"]):
+        actions.append({"action": "zoom", "factor": 1.3})
+    elif any(w in text for w in ["rotate", "ghumao"]):
+        actions.append({"action": "rotate", "degrees": 90})
+    elif any(w in text for w in ["crop", "square"]):
+        actions.append({"action": "crop_square"})
+    elif any(w in text for w in ["watermark"]):
+        actions.append({"action": "watermark_text", "text": "My Video"})
+    elif any(w in text for w in ["fade"]):
+        actions.append({"action": "fade"})
+    elif any(w in text for w in ["bright", "ujala"]):
+        actions.append({"action": "brightness", "level": 0.3})
+    elif any(w in text for w in ["dark", "andhera"]):
+        actions.append({"action": "brightness", "level": -0.3})
+
+    return actions
+
+
+# ---------------------------------------------------------------
+# Background removal (rembg - open source)
+# ---------------------------------------------------------------
+
+def remove_background_video(video_path, out_path, progress=None):
+    from rembg import remove, new_session
+    import cv2
+
+    session = new_session("u2net")
+    uid = uuid.uuid4().hex[:6]
+    frames_dir = os.path.join(WORK_DIR, f"frames_{uid}")
+    out_frames_dir = os.path.join(WORK_DIR, f"out_frames_{uid}")
+    os.makedirs(frames_dir, exist_ok=True)
+    os.makedirs(out_frames_dir, exist_ok=True)
+
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24
+    frame_count = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        cv2.imwrite(os.path.join(frames_dir, f"f_{frame_count:05d}.png"), frame)
+        frame_count += 1
+    cap.release()
+
+    for i in range(frame_count):
+        with open(os.path.join(frames_dir, f"f_{i:05d}.png"), "rb") as f_in:
+            result = remove(f_in.read(), session=session)
+        with open(os.path.join(out_frames_dir, f"f_{i:05d}.png"), "wb") as f_out:
+            f_out.write(result)
+        if progress is not None:
+            progress((i + 1) / frame_count, desc=f"Background remove: frame {i+1}/{frame_count}")
+
+    cmd = ["ffmpeg", "-y", "-framerate", str(fps),
+           "-i", os.path.join(out_frames_dir, "f_%05d.png"),
+           "-c:v", "libx264", "-pix_fmt", "yuv420p", out_path]
+    run_ffmpeg(cmd)
+    shutil.rmtree(frames_dir, ignore_errors=True)
+    shutil.rmtree(out_frames_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------
+# Subtitles (Whisper - open source)
+# ---------------------------------------------------------------
+
+def add_subtitles(video_path, out_path, progress=None):
+    from faster_whisper import WhisperModel
+
+    if progress is not None:
+        progress(0.1, desc="Audio sun ke samajh raha hoon (Whisper AI)...")
+
+    model = WhisperModel("tiny", device="cpu", compute_type="int8")
+    segments, _ = model.transcribe(video_path)
+
+    srt_path = os.path.join(WORK_DIR, f"sub_{uuid.uuid4().hex[:6]}.srt")
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for i, seg in enumerate(segments, start=1):
+            start = format_timestamp(seg.start)
+            end = format_timestamp(seg.end)
+            f.write(f"{i}\n{start} --> {end}\n{seg.text.strip()}\n\n")
+
+    if progress is not None:
+        progress(0.7, desc="Subtitles video mein daal raha hoon...")
+
+    cmd = ["ffmpeg", "-y", "-i", video_path, "-vf",
+           f"subtitles={srt_path}:force_style='FontSize=20,PrimaryColour=&Hffffff'",
+           out_path]
+    run_ffmpeg(cmd)
+    os.remove(srt_path)
+
+
+def format_timestamp(seconds):
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds - int(seconds)) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+# ---------------------------------------------------------------
+# Ek action ko video par apply karna (FFmpeg based)
+# ---------------------------------------------------------------
+
+def apply_single_action(video_path, action, progress=None):
+    uid = uuid.uuid4().hex[:8]
+    out_path = os.path.join(WORK_DIR, f"step_{uid}.mp4")
+    name = action.get("action")
+
+    if name == "trim":
+        if "from_start_seconds" in action:
+            sec = action["from_start_seconds"]
+            cmd = ["ffmpeg", "-y", "-i", video_path, "-ss", str(sec), "-c", "copy", out_path]
         else:
-            plan["params"]["factor"] = factor
+            sec = action.get("from_end_seconds", 5)
+            duration = get_duration(video_path)
+            new_dur = max(duration - sec, 1)
+            cmd = ["ffmpeg", "-y", "-i", video_path, "-t", str(new_dur), "-c", "copy", out_path]
+        run_ffmpeg(cmd)
 
-    elif any(word in text for word in ["mute", "no audio", "audio hatao", "silent"]):
-        plan["action"] = "mute"
+    elif name == "add_text":
+        text = action.get("text", "Text").replace(":", r"\:").replace("'", "")
+        vf = (f"drawtext=text='{text}':fontcolor=white:fontsize=48:"
+              f"box=1:boxcolor=black@0.5:boxborderw=10:x=(w-text_w)/2:y=h-th-40")
+        cmd = ["ffmpeg", "-y", "-i", video_path, "-vf", vf, "-codec:a", "copy", out_path]
+        run_ffmpeg(cmd)
 
-    elif any(word in text for word in ["gif", "convert to gif"]):
-        plan["action"] = "to_gif"
+    elif name == "speed":
+        factor = action.get("factor", 1.5)
+        atempo_chain = []
+        f = factor
+        while f > 2.0:
+            atempo_chain.append("atempo=2.0")
+            f /= 2.0
+        while f < 0.5:
+            atempo_chain.append("atempo=0.5")
+            f /= 0.5
+        atempo_chain.append(f"atempo={f:.3f}")
+        cmd = ["ffmpeg", "-y", "-i", video_path,
+               "-vf", f"setpts={1/factor:.3f}*PTS",
+               "-af", ",".join(atempo_chain), out_path]
+        run_ffmpeg(cmd)
 
-    elif any(word in text for word in ["audio extract", "nikaalo audio", "mp3", "audio nikalo"]):
-        plan["action"] = "extract_audio"
+    elif name == "mute":
+        cmd = ["ffmpeg", "-y", "-i", video_path, "-c", "copy", "-an", out_path]
+        run_ffmpeg(cmd)
 
-    elif any(word in text for word in ["black white", "grayscale", "bw", "kaala safed"]):
-        plan["action"] = "grayscale"
+    elif name == "to_gif":
+        out_path = os.path.join(WORK_DIR, f"step_{uid}.gif")
+        cmd = ["ffmpeg", "-y", "-i", video_path, "-vf",
+               "fps=10,scale=480:-1:flags=lanczos", out_path]
+        run_ffmpeg(cmd)
+
+    elif name == "extract_audio":
+        out_path = os.path.join(WORK_DIR, f"step_{uid}.mp3")
+        cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "libmp3lame", out_path]
+        run_ffmpeg(cmd)
+
+    elif name == "grayscale":
+        cmd = ["ffmpeg", "-y", "-i", video_path, "-vf", "hue=s=0", out_path]
+        run_ffmpeg(cmd)
+
+    elif name == "remove_bg":
+        remove_background_video(video_path, out_path, progress=progress)
+
+    elif name == "subtitles":
+        add_subtitles(video_path, out_path, progress=progress)
+
+    elif name == "blur":
+        strength = action.get("strength", 15)
+        cmd = ["ffmpeg", "-y", "-i", video_path, "-vf", f"boxblur={strength}", out_path]
+        run_ffmpeg(cmd)
+
+    elif name == "vintage":
+        vf = "curves=vintage,vignette"
+        cmd = ["ffmpeg", "-y", "-i", video_path, "-vf", vf, out_path]
+        run_ffmpeg(cmd)
+
+    elif name == "vignette":
+        cmd = ["ffmpeg", "-y", "-i", video_path, "-vf", "vignette", out_path]
+        run_ffmpeg(cmd)
+
+    elif name == "zoom":
+        factor = action.get("factor", 1.3)
+        cmd = ["ffmpeg", "-y", "-i", video_path, "-vf",
+               f"scale=iw*{factor}:ih*{factor},crop=iw/{factor}:ih/{factor}", out_path]
+        run_ffmpeg(cmd)
+
+    elif name == "rotate":
+        degrees = action.get("degrees", 90)
+        transpose_map = {90: "1", 180: "2,2", 270: "2"}
+        if degrees == 180:
+            vf = "transpose=2,transpose=2"
+        elif degrees == 270:
+            vf = "transpose=2"
+        else:
+            vf = "transpose=1"
+        cmd = ["ffmpeg", "-y", "-i", video_path, "-vf", vf, out_path]
+        run_ffmpeg(cmd)
+
+    elif name == "crop_square":
+        cmd = ["ffmpeg", "-y", "-i", video_path, "-vf",
+               "crop='min(iw,ih)':'min(iw,ih)'", out_path]
+        run_ffmpeg(cmd)
+
+    elif name == "watermark_text":
+        text = action.get("text", "My Video").replace(":", r"\:").replace("'", "")
+        vf = (f"drawtext=text='{text}':fontcolor=white@0.6:fontsize=24:"
+              f"x=w-tw-20:y=h-th-20")
+        cmd = ["ffmpeg", "-y", "-i", video_path, "-vf", vf, "-codec:a", "copy", out_path]
+        run_ffmpeg(cmd)
+
+    elif name == "fade":
+        duration = get_duration(video_path)
+        fade_out_start = max(duration - 1.5, 0)
+        vf = f"fade=t=in:st=0:d=1.5,fade=t=out:st={fade_out_start}:d=1.5"
+        cmd = ["ffmpeg", "-y", "-i", video_path, "-vf", vf, out_path]
+        run_ffmpeg(cmd)
+
+    elif name == "brightness":
+        level = action.get("level", 0.2)
+        cmd = ["ffmpeg", "-y", "-i", video_path, "-vf", f"eq=brightness={level}", out_path]
+        run_ffmpeg(cmd)
 
     else:
-        plan["action"] = "unknown"
+        return video_path  # koi change nahi
 
-    return plan
+    return out_path
 
 
-def apply_edit(video_path, instruction):
+# ---------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------
+
+def apply_edit(video_path, instruction, progress=gr.Progress()):
     if video_path is None:
         return None, "Pehle ek video upload karo."
 
-    plan = parse_instruction(instruction)
-    action = plan["action"]
-    params = plan["params"]
+    progress(0, desc="Instruction samajh raha hoon...")
 
-    uid = uuid.uuid4().hex[:8]
-    out_path = os.path.join(WORK_DIR, f"output_{uid}.mp4")
+    actions = None
+    used_llm = False
+    if GROQ_API_KEY:
+        actions = understand_instruction_with_llm(instruction)
+        if actions:
+            used_llm = True
 
+    if not actions:
+        actions = fallback_parse(instruction)
+
+    if not actions:
+        return None, (
+            "Instruction samajh nahi aaya. Thoda clearly batao, jaise:\n"
+            "- 'background hatao' / 'subtitles add karo' / 'blur karo'\n"
+            "- 'pehle 10 second kaato' / 'text likho Hello'\n"
+            "- 'speed 2x karo' / 'vintage effect lagao' / 'zoom karo'"
+        )
+
+    current_video = video_path
+    total = len(actions)
     try:
-        if action == "trim":
-            if "from_start" in params:
-                sec = params["from_start"]
-                cmd = ["ffmpeg", "-y", "-i", video_path, "-ss", str(sec), "-c", "copy", out_path]
-            else:
-                sec = params["from_end"]
-                # duration nikaalo
-                probe = subprocess.run(
-                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                     "-of", "default=noprint_wrappers=1:nokey=1", video_path],
-                    capture_output=True, text=True
-                )
-                duration = float(probe.stdout.strip())
-                new_duration = max(duration - sec, 1)
-                cmd = ["ffmpeg", "-y", "-i", video_path, "-t", str(new_duration), "-c", "copy", out_path]
-            run_ffmpeg(cmd)
-            msg = f"Video trim ho gaya ({sec} second hataye gaye)."
+        for idx, action in enumerate(actions):
+            def sub_progress(frac, desc=""):
+                overall = (idx + frac) / total
+                progress(overall, desc=desc or f"Step {idx+1}/{total}")
+            current_video = apply_single_action(current_video, action, progress=sub_progress)
 
-        elif action == "add_text":
-            text = params["text"].replace(":", r"\:").replace("'", "")
-            drawtext = (
-                f"drawtext=text='{text}':fontcolor=white:fontsize=48:"
-                f"box=1:boxcolor=black@0.5:boxborderw=10:"
-                f"x=(w-text_w)/2:y=h-th-40"
-            )
-            cmd = ["ffmpeg", "-y", "-i", video_path, "-vf", drawtext,
-                   "-codec:a", "copy", out_path]
-            run_ffmpeg(cmd)
-            msg = f"Text overlay add ho gaya: '{params['text']}'"
-
-        elif action == "speed":
-            factor = params["factor"]
-            atempo = factor
-            # atempo filter sirf 0.5 - 2.0 range support karta hai per step
-            atempo_chain = []
-            f = atempo
-            while f > 2.0:
-                atempo_chain.append("atempo=2.0")
-                f /= 2.0
-            while f < 0.5:
-                atempo_chain.append("atempo=0.5")
-                f /= 0.5
-            atempo_chain.append(f"atempo={f:.3f}")
-            audio_filter = ",".join(atempo_chain)
-            cmd = ["ffmpeg", "-y", "-i", video_path,
-                   "-vf", f"setpts={1/factor:.3f}*PTS",
-                   "-af", audio_filter, out_path]
-            run_ffmpeg(cmd)
-            msg = f"Video speed {factor}x kar diya gaya."
-
-        elif action == "mute":
-            cmd = ["ffmpeg", "-y", "-i", video_path, "-c", "copy", "-an", out_path]
-            run_ffmpeg(cmd)
-            msg = "Audio hata diya gaya (video ab mute hai)."
-
-        elif action == "to_gif":
-            out_path = os.path.join(WORK_DIR, f"output_{uid}.gif")
-            cmd = ["ffmpeg", "-y", "-i", video_path, "-vf",
-                   "fps=10,scale=480:-1:flags=lanczos", out_path]
-            run_ffmpeg(cmd)
-            msg = "Video GIF mein convert ho gaya."
-
-        elif action == "extract_audio":
-            out_path = os.path.join(WORK_DIR, f"output_{uid}.mp3")
-            cmd = ["ffmpeg", "-y", "-i", video_path, "-vn",
-                   "-acodec", "libmp3lame", out_path]
-            run_ffmpeg(cmd)
-            msg = "Audio alag se nikaal diya gaya (MP3)."
-
-        elif action == "grayscale":
-            cmd = ["ffmpeg", "-y", "-i", video_path, "-vf", "hue=s=0", out_path]
-            run_ffmpeg(cmd)
-            msg = "Video black & white kar diya gaya."
-
-        else:
-            return None, (
-                "Yeh instruction samajh nahi aaya. Abhi supported commands:\n"
-                "- 'pehle 10 second kaato' (trim)\n"
-                "- 'text likho \"Hello\"' (overlay)\n"
-                "- 'speed 2x tez karo' (speed change)\n"
-                "- 'audio hatao / mute karo'\n"
-                "- 'gif banao'\n"
-                "- 'audio nikaalo'\n"
-                "- 'black white karo'"
-            )
-
-        return out_path, msg
+        engine = "Groq AI (LLM ne samjha)" if used_llm else "Keyword matching"
+        msg = f"Ho gaya! ({engine}) Actions apply hue: " + ", ".join(a["action"] for a in actions)
+        return current_video, msg
 
     except Exception as e:
         return None, f"Error aa gaya: {str(e)}"
 
 
-with gr.Blocks(title="AI Video Editor") as demo:
-    gr.Markdown("# 🎬 AI Video Editor (Free & Open Source)")
-    gr.Markdown(
-        "Video upload karo, neeche text box mein Hindi/English mein bata do "
-        "kya edit karna hai — jaise *'pehle 10 second kaato'* ya *'text likho Hello'*."
-    )
+with gr.Blocks(title="AI Video Editor - High Level") as demo:
+    gr.Markdown("# 🎬 AI Video Editor (High-Level, Free & Open Source)")
+    if GROQ_API_KEY:
+        gr.Markdown("✅ **Smart mode ON** — kaisi bhi bhasha mein bolo, AI samjhega.")
+    else:
+        gr.Markdown(
+            "⚠️ **Basic mode** — abhi sirf fixed keywords samajhta hai. "
+            "Smart mode on karne ke liye `GROQ_API_KEY` environment variable set karo."
+        )
 
     with gr.Row():
         with gr.Column():
             video_input = gr.Video(label="Video Upload Karo")
             instruction_input = gr.Textbox(
-                label="Instruction Do",
-                placeholder='Jaise: pehle 10 second kaato, ya text likho "Namaste"'
+                label="Instruction Do (apni bhasha mein bolo)",
+                placeholder='Jaise: "background hatao aur subtitles bhi add kar do"',
+                lines=2
             )
             submit_btn = gr.Button("Edit Karo", variant="primary")
 
         with gr.Column():
             video_output = gr.File(label="Edited Output")
-            status_output = gr.Textbox(label="Status", interactive=False)
+            status_output = gr.Textbox(label="Status", interactive=False, lines=3)
 
     submit_btn.click(
         fn=apply_edit,
@@ -225,16 +473,15 @@ with gr.Blocks(title="AI Video Editor") as demo:
     )
 
     gr.Markdown(
-        "### Supported Commands (abhi ke liye)\n"
-        "- Trim / cut karna (start ya end se)\n"
-        "- Text overlay add karna\n"
-        "- Speed badalna/kam karna\n"
-        "- Audio mute karna\n"
-        "- GIF banana\n"
-        "- Audio nikalna (MP3)\n"
-        "- Black & white karna\n"
+        "### Yeh sab kar sakta hai\n"
+        "Background remove • Subtitles • Trim • Text overlay • Speed • Mute • "
+        "GIF • Audio extract • Black&white • Blur • Vintage • Vignette • Zoom • "
+        "Rotate • Square crop • Watermark • Fade in/out • Brightness\n\n"
+        "**Ek saath multiple bhi bol sakte ho** (Smart mode mein): "
+        "*'pehle 5 second kaato, phir subtitles add karo aur vintage effect lagao'*"
     )
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
     demo.launch(server_name="0.0.0.0", server_port=port)
+            
